@@ -132,6 +132,11 @@ protected:
   int init_calc_exprs();
   // resolve the pushed-down topk limit from ir_ctdef_ (limit + offset), 0 if absent.
   int init_topk_limit();
+  // Prepare the skip bit vector with the given declared size. The vector is
+  // reallocated when the request exceeds the current capacity, so that a
+  // reset() never memsets beyond the allocated buffer (topk_limit_ is user
+  // controlled and can be much larger than max_batch_size_).
+  int prepare_skip_vector(const int64_t size);
   void clear_row_wise_evaluated_flag();
   void clear_batch_wise_evaluated_flag(const int64_t &count);
   // TODO: delete this after enable standard vectorized execution
@@ -196,6 +201,7 @@ protected:
   ObObj *fwd_range_objs_;
   sql::ObExpr *doc_token_cnt_expr_;
   sql::ObBitVector *skip_;
+  int64_t skip_capacity_; // allocated capacity of skip_ in bits
   int64_t token_doc_cnt_;
   int64_t max_batch_size_;
   int64_t topk_limit_; // pushed-down topk limit (limit + offset), 0 when absent

@@ -90,7 +90,7 @@ int ObExprBM25::eval_bm25_relevance_expr(const ObExpr &expr, ObEvalCtx &ctx, ObD
       const int64_t related_token_cnt = related_token_cnt_datum->get_uint();
       const int64_t doc_token_cnt = doc_token_cnt_datum->get_uint();
       const double avg_doc_token_cnt = avg_doc_token_cnt_datum->get_double();
-      const double norm_len = doc_token_cnt / avg_doc_token_cnt;
+      const double norm_len = normalize_length(doc_token_cnt, avg_doc_token_cnt);
       const double token_weight = query_token_weight(token_doc_cnt, total_doc_cnt);
       const double doc_weight = doc_token_weight(related_token_cnt, norm_len);
       const double relevance = token_weight * doc_weight;
@@ -127,7 +127,7 @@ int ObExprBM25::eval_bm25_relevance_expr(const ObExpr &expr, ObEvalCtx &ctx, ObD
       const int64_t related_token_cnt = related_token_cnt_datum->get_uint();
       const int64_t doc_token_cnt = doc_length_datum->get_uint();
       const double avg_doc_token_cnt = avg_doc_token_cnt_datum->get_double();
-      const double norm_len = doc_token_cnt / avg_doc_token_cnt;
+      const double norm_len = normalize_length(doc_token_cnt, avg_doc_token_cnt);
       const double token_weight = token_weight_datum->get_double();
       const double doc_weight = doc_token_weight(related_token_cnt, norm_len);
       const double relevance = token_weight * doc_weight;
@@ -179,7 +179,7 @@ int ObExprBM25::eval_batch_bm25_relevance_expr(const ObExpr &expr, ObEvalCtx &ct
         }  else if (!skip.contain(i) && !eval_flags.at(i)) {
           const int64_t related_token_cnt = related_token_cnt_datum.at(i)->get_uint();
           const uint64_t doc_token_cnt = doc_token_cnt_datum.at(i)->get_uint();
-          const double norm_len = doc_token_cnt / avg_doc_token_cnt;
+          const double norm_len = normalize_length(doc_token_cnt, avg_doc_token_cnt);
           const double doc_weight = doc_token_weight(related_token_cnt, norm_len);
           const double relevance = token_weight * doc_weight;
           res_datum[i].set_double(relevance);
@@ -227,7 +227,7 @@ int ObExprBM25::eval_batch_bm25_relevance_expr(const ObExpr &expr, ObEvalCtx &ct
           }  else if (!skip.contain(i) && !eval_flags.at(i)) {
             const int64_t related_token_cnt = related_token_cnt_datum.at(i)->get_uint();
             const uint64_t doc_token_cnt = doc_length_datum.at(i)->get_uint();
-            const double norm_len = doc_token_cnt / avg_doc_token_cnt;
+            const double norm_len = normalize_length(doc_token_cnt, avg_doc_token_cnt);
             const double doc_weight = doc_token_weight(related_token_cnt, norm_len);
             const double relevance = token_weight * doc_weight;
             res_datum[i].set_double(relevance);
@@ -245,7 +245,11 @@ int ObExprBM25::eval_batch_bm25_relevance_expr(const ObExpr &expr, ObEvalCtx &ct
 double ObExprBM25::doc_token_weight(const int64_t token_freq, const double norm_len)
 {
   const double tf = static_cast<double>(token_freq);
-  return tf / (tf + p_k1 * (1.0 - p_b + p_b * norm_len));
+  const double denom = tf + p_k1 * (1.0 - p_b + p_b * norm_len);
+  // A zero denominator (b == 1.0 together with norm_len == 0, i.e. an empty
+  // document) would yield 0/0 == NaN, and a NaN relevance breaks every later
+  // score comparison in the top-k pruning path. Keep the term contribution at 0.
+  return denom > 0.0 ? tf / denom : 0.0;
 }
 
 double ObExprBM25::query_token_weight(const int64_t doc_freq, const int64_t doc_cnt)

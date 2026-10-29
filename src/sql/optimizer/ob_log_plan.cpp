@@ -7978,6 +7978,33 @@ int ObLogPlan::try_push_limit_into_table_scan(ObLogicalOperator *top,
     ObRawExpr *new_offset_expr = NULL;
 
     bool has_npd_filter = false; //has non-pushdown filter
+    // A text retrieval scan cannot skip OFFSET rows by itself: the DAS text
+    // retrieval iterator only converts the pushed (limit, offset) pair into a
+    // top-k of (limit + offset) and emits the whole window. Dropping the LIMIT
+    // operator in that case leaks the leading OFFSET rows into the result
+    // (LIMIT 10 OFFSET 5 returned 15 rows), so keep the LIMIT operator with its
+    // OFFSET on top of such a scan. The top-k pushdown itself is left untouched,
+    // hence the scan still stops after (limit + offset) rows.
+    bool keep_limit_for_offset = false;
+    if (OB_SUCC(ret) && OB_NOT_NULL(offset_expr) && table_scan->is_text_retrieval_scan()) {
+      int64_t offset_value = 0;
+      bool is_null_value = false;
+      if (OB_FAIL(ObTransformUtils::get_expr_int_value(offset_expr,
+                                                       get_optimizer_context().get_params(),
+                                                       get_optimizer_context().get_exec_ctx(),
+                                                       &get_allocator(),
+                                                       offset_value,
+                                                       is_null_value))) {
+        // offset is not resolvable at plan time, be conservative
+        ret = OB_SUCCESS;
+        keep_limit_for_offset = true;
+        LOG_TRACE("keep limit above text retrieval scan, offset not resolvable");
+      } else if (is_null_value || offset_value > 0) {
+        keep_limit_for_offset = true;
+        LOG_TRACE("keep limit above text retrieval scan due to offset",
+                  K(offset_value), K(is_null_value));
+      }
+    }
     //if TSC contains filters that cannot be pushdown to the storage
     //the limit clause cannot be pushed down either.
     if (OB_FAIL(table_scan->has_nonpushdown_filter(has_npd_filter))) {
@@ -8011,15 +8038,15 @@ int ObLogPlan::try_push_limit_into_table_scan(ObLogicalOperator *top,
                  OB_FAIL(construct_startup_filter_for_limit(new_limit_expr, table_scan))) {
         LOG_WARN("failed to construct startup filter", KPC(limit_expr));
       } else {
-        is_pushed = true;
+        is_pushed = !keep_limit_for_offset;
       }
       if (das_multi_partition) {
         is_pushed = false;
       }
     } else if (OB_NOT_NULL(table_scan->get_text_retrieval_info().topk_limit_expr_)) {
-      is_pushed = true;
+      is_pushed = !keep_limit_for_offset;
     } else if (OB_NOT_NULL(table_scan->get_vector_index_info().topk_limit_expr_)) {
-      is_pushed = true;
+      is_pushed = !keep_limit_for_offset;
     }
   } else { /*do nothing*/ }
   return ret;
@@ -15491,34 +15518,11 @@ int ObLogPlan::try_push_topn_into_text_retrieval_scan(ObLogicalOperator *&top,
       }
     }
   }
-  // The top-k pushdown below is only valid when the OFFSET (if any) is applied
-  // by the LIMIT operator kept above this scan. When the statement carries a
-  // non-zero OFFSET, keep the sort operator instead of pushing the top-k into
-  // the scan, otherwise the rows skipped by the scan side and the rows skipped
-  // by the LIMIT side would not compose into the correct result window.
-  bool can_push_topn = can_pushdown;
-  if (OB_SUCC(ret) && can_push_topn && OB_NOT_NULL(offset_expr)) {
-    int64_t offset_value = 0;
-    bool is_null_value = false;
-    if (OB_FAIL(ObTransformUtils::get_expr_int_value(offset_expr,
-                                                     get_optimizer_context().get_params(),
-                                                     get_optimizer_context().get_exec_ctx(),
-                                                     &get_allocator(),
-                                                     offset_value,
-                                                     is_null_value))) {
-      // The offset value is not resolvable at plan time (e.g. an unbound
-      // parameter), conservatively disable the pushdown for correctness.
-      can_push_topn = false;
-      LOG_TRACE("text retrieval topk pushdown skipped, offset not resolvable", K(ret));
-      ret = OB_SUCCESS;
-    } else if (0 == offset_value) {
-      // a zero offset behaves like no offset, keep the pushdown
-    } else {
-      can_push_topn = false;
-      LOG_TRACE("text retrieval topk pushdown skipped due to offset", K(offset_value));
-    }
-  }
-  if (OB_SUCC(ret) && can_push_topn && sort_keys.count() >= 1 && OB_NOT_NULL(sort_keys.at(0).expr_)
+  // The top-k pushdown below pushes (limit + offset) rows into the scan. The
+  // leading OFFSET rows are skipped by the LIMIT operator that stays on top of
+  // the scan whenever the statement carries a non-zero OFFSET (see
+  // try_push_limit_into_table_scan), so the pushdown stays valid in that case.
+  if (OB_SUCC(ret) && can_pushdown && sort_keys.count() >= 1 && OB_NOT_NULL(sort_keys.at(0).expr_)
       && OB_NOT_NULL(target_tr_info) && OB_NOT_NULL(target_tr_info->match_expr_)) {
     if (OB_NOT_NULL(sort_keys.at(0).expr_) && OB_NOT_NULL(target_tr_info->match_expr_) &&
         sort_keys.at(0).expr_->same_as(*target_tr_info->match_expr_)) {

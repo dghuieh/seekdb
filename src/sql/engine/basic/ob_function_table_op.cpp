@@ -236,7 +236,6 @@ int ObFunctionTableOp::inner_get_next_row_sys_func()
   if (OB_NOT_NULL(MY_SPEC.value_expr_)) {
     MY_SPEC.value_expr_->clear_evaluated_flag(eval_ctx_);
   }
-  LOG_WARN("[FT_DBG] sys_func enter", K(col_count_), K(MY_SPEC.column_exprs_.count()));
   if (OB_ISNULL(plan_ctx = ctx_.get_physical_plan_ctx())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("failed to get plan ctx", K(ret), K(plan_ctx));
@@ -247,7 +246,8 @@ int ObFunctionTableOp::inner_get_next_row_sys_func()
       LOG_WARN("failed to eval value expr", K(ret));
     }
   } else if (T_FUN_SYS_AI_SPLIT_DOCUMENT == MY_SPEC.value_expr_->type_) {
-    // AI_SPLIT_DOCUMENT: eval 已把当前行 4 列填入 ObExprAISplitDocumentCtx，执行器逐列拷贝
+    // AI_SPLIT_DOCUMENT: the expression fills the 4-column split context
+    // (id, offset, length, text) and the operator copies it out column by column.
     ObExprAISplitDocumentCtx *split_ctx = NULL;
     if (OB_ISNULL(split_ctx = static_cast<ObExprAISplitDocumentCtx *>(
                     ctx_.get_expr_op_ctx(MY_SPEC.value_expr_->expr_ctx_id_)))) {
@@ -256,7 +256,13 @@ int ObFunctionTableOp::inner_get_next_row_sys_func()
     } else {
       const int64_t col_cnt = MY_SPEC.column_exprs_.count();
       for (int64_t i = 0; OB_SUCC(ret) && i < col_cnt; ++i) {
-        ObDatum &datum = MY_SPEC.column_exprs_.at(i)->locate_datum_for_write(eval_ctx_);
+        ObExpr *col_expr = MY_SPEC.column_exprs_.at(i);
+        if (OB_ISNULL(col_expr)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("column expr of function table is null", K(ret), K(i), K(col_cnt));
+          break;
+        }
+        ObDatum &datum = col_expr->locate_datum_for_write(eval_ctx_);
         if (0 == i) {
           datum.set_int(split_ctx->cur_id_);
         } else if (1 == i) {
@@ -266,15 +272,17 @@ int ObFunctionTableOp::inner_get_next_row_sys_func()
         } else {
           datum.set_string(split_ctx->cur_text_);
         }
-        MY_SPEC.column_exprs_.at(i)->set_evaluated_projected(eval_ctx_);
+        col_expr->set_evaluated_projected(eval_ctx_);
       }
-      LOG_WARN("[FT_DBG] sys_func row filled", K(col_cnt), K(ret));
     }
+  } else if (OB_UNLIKELY(MY_SPEC.column_exprs_.empty() || OB_ISNULL(MY_SPEC.column_exprs_.at(0)))) {
+    // Defensive check: an empty column list would make at(0) below read out of bounds.
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("column exprs of function table is empty", K(ret), K(MY_SPEC.column_exprs_.count()));
   } else {
     MY_SPEC.column_exprs_.at(0)->locate_datum_for_write(eval_ctx_).set_datum(*value);
     MY_SPEC.column_exprs_.at(0)->set_evaluated_projected(eval_ctx_);
   }
-  LOG_WARN("[FT_DBG] sys_func exit", K(ret));
   return ret;
 }
 

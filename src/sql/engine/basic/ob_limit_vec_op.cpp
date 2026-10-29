@@ -149,7 +149,12 @@ int ObLimitVecOp::inner_get_next_batch(const int64_t max_row_cnt)
         } else {
           ++input_cnt_;
           if (input_cnt_ <= offset_) {
-            brs_.skip_->set(i);
+            // Use set_skip() instead of skip_->set(i): brs_ is a deep copy of the
+            // child batch and therefore inherits its all_rows_active_ flag. When
+            // the child reports a fully active batch, consumers skip the bit
+            // vector entirely and the OFFSET rows would still be emitted
+            // (LIMIT 10 OFFSET 5 returned 15 rows).
+            brs_.set_skip(i);
           } else {
             break;
           }

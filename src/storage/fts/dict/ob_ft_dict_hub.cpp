@@ -21,6 +21,7 @@
 #include "lib/ob_errno.h"
 #include "lib/oblog/ob_log_module.h"
 #include "lib/utility/ob_macro_utils.h"
+#include "share/rc/ob_tenant_base.h"
 #include "storage/fts/dict/ob_ft_cache_container.h"
 #include "storage/fts/dict/ob_ft_dict_def.h"
 #include "storage/fts/dict/ob_ft_range_dict.h"
@@ -32,10 +33,18 @@ namespace
 {
 uint64_t get_dict_name_hash(const ObFTDictDesc &desc)
 {
+  uint64_t hash = 0;
   if (ObFTDictType::DICT_IK_CUSTOM == desc.type_ && desc.name_.length() > 0) {
-    return common::murmurhash(desc.name_.ptr(), desc.name_.length(), 0);
+    // The dict hub is a process wide singleton, so everything that identifies the
+    // dictionary has to take part in the cache key. The name alone is not enough:
+    // the same custom dict name can be registered with different collations, and a
+    // plain name hash would let those two definitions share (or, on a hash
+    // collision, expose each other's) cache entry and in-memory trie.
+    const int32_t coll_type = static_cast<int32_t>(desc.coll_type_);
+    hash = common::murmurhash(&coll_type, sizeof(coll_type), hash);
+    hash = common::murmurhash(desc.name_.ptr(), desc.name_.length(), hash);
   }
-  return 0;
+  return hash;
 }
 } // namespace
 

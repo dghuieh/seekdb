@@ -61,10 +61,19 @@ public:
       const int64_t doc_cnt,
       const double avg_doc_token_cnt)
   {
-    OB_ASSERT(avg_doc_token_cnt != 0);
-    const double norm_len = doc_length / avg_doc_token_cnt;
+    const double norm_len = normalize_length(doc_length, avg_doc_token_cnt);
     const double score = query_token_weight(doc_freq, doc_cnt) * doc_token_weight(token_freq, norm_len);
     return score;
+  }
+  // Normalize a document length by the average token count of the whole index.
+  // The average is derived from statistics (or user supplied parameters), so it may
+  // be zero, negative, NaN or infinite; dividing by it would propagate NaN/Inf into
+  // the relevance and break the top-k ordering. Fall back to the default instead.
+  static double normalize_length(const int64_t doc_length, const double avg_doc_token_cnt)
+  {
+    const double safe_avg = (avg_doc_token_cnt > 0.0 && avg_doc_token_cnt < 1e15)
+        ? avg_doc_token_cnt : DEFAULT_AVG_DOC_TOKEN_CNT;
+    return static_cast<double>(doc_length) / safe_avg;
   }
   static double doc_token_weight(const int64_t token_freq, const double norm_len);
   static double query_token_weight(const int64_t doc_freq, const int64_t doc_cnt);

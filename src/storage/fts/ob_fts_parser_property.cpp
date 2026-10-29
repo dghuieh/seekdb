@@ -135,6 +135,27 @@ int ObFTParserJsonProps::config_set_ngram_token_size(const int64_t size)
   return ret;
 }
 
+namespace {
+// dict_table is interpolated into a kernel SQL statement (SELECT word FROM <dict_table>)
+// when the dict table iterator is built, so it must be a plain [db.]table identifier.
+bool is_valid_dict_table_name(const ObString &name)
+{
+  bool valid = (name.length() > 0 && name.length() <= 256 && OB_NOT_NULL(name.ptr()));
+  int64_t dot_cnt = 0;
+  for (int64_t i = 0; valid && i < name.length(); ++i) {
+    const char c = name.ptr()[i];
+    if ('.' == c) {
+      ++dot_cnt;
+      valid = (dot_cnt <= 1 && i > 0 && i < name.length() - 1);
+    } else {
+      valid = ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+               || (c >= '0' && c <= '9') || '_' == c || '$' == c);
+    }
+  }
+  return valid;
+}
+} // anonymous namespace
+
 // should string deep copy?
 int ObFTParserJsonProps::config_set_dict_table(const ObString &str)
 {
@@ -143,6 +164,10 @@ int ObFTParserJsonProps::config_set_dict_table(const ObString &str)
   if (!IS_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("Props not init", K(ret));
+  } else if (OB_UNLIKELY(!is_valid_dict_table_name(str))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid dict table name", K(ret), K(str));
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "invalid dict table name");
   } else if (OB_ISNULL(dict_table = OB_NEWx(ObJsonString, &allocator_, str))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("Fail to new ObJsonString", K(ret));

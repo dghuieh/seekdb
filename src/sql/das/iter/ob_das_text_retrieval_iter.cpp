@@ -46,6 +46,7 @@ ObDASTextRetrievalIter::ObDASTextRetrievalIter()
     fwd_range_objs_(nullptr),
     doc_token_cnt_expr_(nullptr),
     skip_(nullptr),
+    skip_capacity_(0),
     token_doc_cnt_(0),
     max_batch_size_(0),
     topk_limit_(0),
@@ -208,16 +209,42 @@ int ObDASTextRetrievalIter::inner_init(ObDASIterParam &param)
       }
     }
 
-    const int64_t default_size = OB_MAX(max_batch_size_, 1);
+    // The skip vector must cover the vectorized batch size *and* the pushed-down
+    // topk limit (limit + offset), because ObDASTRCacheIter::inner_reuse() resets
+    // the vector to OB_MAX(max_batch_size_, topk_limit_). topk_limit_ is user
+    // controlled and may be far larger than max_batch_size_, so allocating only
+    // max_batch_size_ bits made that reset() a heap buffer overflow.
+    const int64_t default_size = OB_MAX(OB_MAX(max_batch_size_, topk_limit_), 1);
     if (OB_FAIL(ret)) {
     } else if (OB_FAIL(init_calc_exprs())) {
       LOG_WARN("failed to init row-wise calc exprs", K(ret));
-    } else if (OB_ISNULL(skip_ = to_bit_vector(allocator_.alloc(ObBitVector::memory_size(default_size))))) {
-      ret = OB_ALLOCATE_MEMORY_FAILED;
-      LOG_WARN("failed to allocate skip bit vector", K(ret));
+    } else if (OB_FAIL(prepare_skip_vector(default_size))) {
+      LOG_WARN("failed to init skip bit vector", K(ret), K(default_size));
     } else {
-      skip_->init(default_size);
       is_inited_ = true;
+    }
+  }
+  return ret;
+}
+
+int ObDASTextRetrievalIter::prepare_skip_vector(const int64_t size)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(size <= 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid skip vector size", K(ret), K(size));
+  } else if (OB_NOT_NULL(skip_) && skip_capacity_ >= size) {
+    // reuse the existing allocation: declaring a smaller size is always safe
+    skip_->reset(size);
+  } else {
+    sql::ObBitVector *new_skip = to_bit_vector(allocator_.alloc(ObBitVector::memory_size(size)));
+    if (OB_ISNULL(new_skip)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate skip bit vector", K(ret), K(size));
+    } else {
+      new_skip->init(size);
+      skip_ = new_skip;
+      skip_capacity_ = size;
     }
   }
   return ret;
@@ -226,24 +253,22 @@ int ObDASTextRetrievalIter::inner_init(ObDASIterParam &param)
 int ObDASTextRetrievalIter::inner_reuse()
 {
   int ret = OB_SUCCESS;
-  if (OB_NOT_NULL(skip_)) {
-    skip_->reset(OB_MAX(max_batch_size_, 1));
-  }
   if (nullptr != mem_context_) {
     mem_context_->reset_remain_one_page();
   }
 
-  int64_t old_default_size = OB_MAX(max_batch_size_, 1);
+  const int64_t old_max_batch_size = max_batch_size_;
   max_batch_size_ = ir_rtdef_->eval_ctx_->max_batch_size_;
-  if (old_default_size < OB_MAX(max_batch_size_, 1)) {
-    const int64_t default_size = OB_MAX(max_batch_size_, 1);
+  if (old_max_batch_size < max_batch_size_) {
+    // The batch size grew, so the arena is rebuilt from scratch: drop the cached
+    // skip vector metadata together with its memory and reallocate below.
     allocator_.reuse();
-    if (OB_ISNULL(skip_ = to_bit_vector(allocator_.alloc(ObBitVector::memory_size(default_size))))) {
-      ret = OB_ALLOCATE_MEMORY_FAILED;
-      LOG_WARN("failed to allocate skip bit vector", K(ret));
-    } else {
-      skip_->init(default_size); 
-    }
+    skip_ = nullptr;
+    skip_capacity_ = 0;
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(prepare_skip_vector(OB_MAX(OB_MAX(max_batch_size_, topk_limit_), 1)))) {
+    LOG_WARN("failed to reuse skip bit vector", K(ret), K(max_batch_size_), K(topk_limit_));
   }
   if (OB_SUCC(ret)) {
     const ObTabletID &old_inv_scan_id = inv_idx_scan_param_.tablet_id_;
@@ -320,6 +345,7 @@ int ObDASTextRetrievalIter::inner_release()
   fwd_range_objs_ = nullptr;
   doc_token_cnt_expr_ = nullptr;
   skip_ = nullptr;
+  skip_capacity_ = 0;
   tx_desc_ = nullptr;
   snapshot_ = nullptr;
   token_doc_cnt_ = 0;
@@ -1153,6 +1179,9 @@ int ObDASTRCacheIter::inner_reuse()
     relevance_.reuse();
     doc_id_.reuse();
     allocator_.reuse();
+    // the whole arena is gone, so the cached skip vector is dangling now
+    skip_ = nullptr;
+    skip_capacity_ = 0;
     if (OB_FAIL(relevance_.init(default_size))) {
       LOG_WARN("failed to init relevance_ array", K(ret));
     } else if (OB_FAIL(relevance_.prepare_allocate(default_size))) {
@@ -1161,17 +1190,14 @@ int ObDASTRCacheIter::inner_reuse()
       LOG_WARN("failed to init doc_id_ array", K(ret));
     } else if (OB_FAIL(doc_id_.prepare_allocate(default_size))) {
       LOG_WARN("failed to prepare allocate doc_id_ array", K(ret));
-    } else if (OB_ISNULL(skip_ = to_bit_vector(allocator_.alloc(ObBitVector::memory_size(default_size))))) {
-      ret = OB_ALLOCATE_MEMORY_FAILED;
-      LOG_WARN("failed to allocate skip bit vector", K(ret));
-    } else {
-      skip_->init(default_size);
+    } else if (OB_FAIL(prepare_skip_vector(default_size))) {
+      LOG_WARN("failed to init skip bit vector", K(ret), K(default_size));
     }
   } else {
-    // Re-init the skip vector to the new size without reallocating the arrays
-    // (topk can change between executions with the same max_batch_size_).
-    if (OB_NOT_NULL(skip_)) {
-      skip_->reset(default_size);
+    // topk can change between executions with the same max_batch_size_: only the
+    // declared size has to move, and the allocation is grown when it does not fit.
+    if (OB_FAIL(prepare_skip_vector(default_size))) {
+      LOG_WARN("failed to reset skip bit vector", K(ret), K(default_size));
     }
   }
   cur_idx_ = -1;
@@ -1275,9 +1301,31 @@ int ObDASTRCacheIter::project_cached_batch(const int64_t start, const int64_t co
     LOG_WARN("unexpected cached row range", K(ret), K(start), K(count), K_(total_cnt));
   } else {
     ObDatum *doc_datums = doc_id_expr->locate_datums_for_update(*outer_ctx, count);
-    for (int64_t i = 0; i < count; ++i) {
-      doc_datums[i] = doc_id_.at(start + i).get_datum();  // shallow copy
-      doc_id_expr->get_evaluated_flags(*outer_ctx).set(i);
+    // A cached doc id is a string datum whose payload lives in the iterator arena,
+    // and inner_reuse() calls allocator_.reuse() when the buffer grows. Handing a
+    // shallow copy to the upper layer therefore leaves a dangling pointer as soon
+    // as the iterator is reused (the consumer may keep the projected batch across
+    // executions). Deep copy string payloads into the projection expr's own result
+    // buffer; numeric doc ids are stored inline in the datum and stay safe.
+    const ObObjTypeClass id_type_class = ob_obj_type_class(doc_id_expr->datum_meta_.get_type());
+    const bool need_deep_copy_id = (ObStringTC == id_type_class || ObTextTC == id_type_class);
+    for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
+      const ObDatum &src_id = doc_id_.at(start + i).get_datum();
+      if (!need_deep_copy_id || OB_ISNULL(src_id.ptr_) || src_id.len_ <= 0) {
+        doc_datums[i] = src_id;
+      } else {
+        char *id_dst = doc_id_expr->get_str_res_mem(*outer_ctx, src_id.len_, i);
+        if (OB_ISNULL(id_dst)) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          LOG_WARN("failed to get result memory for cached doc id", K(ret), K(src_id.len_));
+        } else {
+          MEMCPY(id_dst, src_id.ptr_, src_id.len_);
+          doc_datums[i].set_string(ObString(static_cast<int32_t>(src_id.len_), id_dst));
+        }
+      }
+      if (OB_SUCC(ret)) {
+        doc_id_expr->get_evaluated_flags(*outer_ctx).set(i);
+      }
     }
     doc_id_expr->set_evaluated_projected(*outer_ctx);
     if (ir_ctdef_->need_calc_relevance()) {
