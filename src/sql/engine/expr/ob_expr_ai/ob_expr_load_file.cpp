@@ -21,6 +21,7 @@
 #include "lib/oblog/ob_log_module.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 
 using namespace oceanbase::common;
@@ -31,6 +32,96 @@ namespace oceanbase
 {
 namespace sql
 {
+
+namespace
+{
+// Upper bound of a single file loaded into memory: it protects the evaluator
+// from allocating an arbitrary amount of memory based on a file size, and keeps
+// the length far away from the int32 ObString range.
+const int64_t MAX_LOAD_FILE_SIZE = 16L * 1024 * 1024;
+const int64_t MAX_LOAD_FILE_PATH_LENGTH = 4096;
+
+// _fullpath() takes the output buffer, the path and its capacity; the POSIX
+// realpath() takes the path and the output buffer. Wrap the Windows one so both
+// call sites below share a single (path, out) signature.
+#ifdef _WIN32
+static inline char *seekdb_path_realpath(const char *path, char *resolved_path)
+{
+  return _fullpath(resolved_path, path, MAX_LOAD_FILE_PATH_LENGTH);
+}
+#define SEEKDB_PATH_REALPATH(path, out) seekdb_path_realpath((path), (out))
+#else
+#define SEEKDB_PATH_REALPATH(path, out) realpath((path), (out))
+#endif
+
+// The file name is resolved *relative* to the location directory. Absolute
+// paths, drive letters, window alternate data streams and any "." or ".."
+// component are rejected, so a location can never escape its own directory.
+int check_relative_file_name(const common::ObString &file_name)
+{
+  int ret = OB_SUCCESS;
+  const char *ptr = file_name.ptr();
+  const int64_t len = file_name.length();
+  if (OB_ISNULL(ptr) || OB_UNLIKELY(len <= 0 || len > MAX_LOAD_FILE_PATH_LENGTH)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_UNLIKELY('/' == ptr[0] || '\\' == ptr[0] || ':' == ptr[0])) {
+    ret = OB_INVALID_ARGUMENT; // absolute path or drive-relative path
+  } else {
+    int64_t seg_start = 0;
+    for (int64_t i = 0; OB_SUCC(ret) && i <= len; ++i) {
+      const bool is_sep = (i == len) || '/' == ptr[i] || '\\' == ptr[i];
+      if (is_sep) {
+        const int64_t seg_len = i - seg_start;
+        if (OB_UNLIKELY(seg_len <= 0)) {
+          ret = OB_INVALID_ARGUMENT; // empty component
+        } else if (OB_UNLIKELY(('.' == ptr[seg_start])
+                               && (1 == seg_len || (2 == seg_len && '.' == ptr[seg_start + 1])))) {
+          // check seg_len before touching ptr[seg_start + 1]: the last component
+          // ends at file_name.length(), which is not guaranteed to be '\0'
+          // terminated, so peeking one byte ahead there would be an out of bound read.
+          ret = OB_INVALID_ARGUMENT; // "." or ".."
+        } else if (OB_UNLIKELY(nullptr != memchr(ptr + seg_start, ':', seg_len))) {
+          ret = OB_INVALID_ARGUMENT; // drive letter or alternate data stream
+        } else {
+          seg_start = i + 1;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+// Compares the canonical (symlink-free, ".."-free) form of the target with the
+// canonical form of the location directory. This catches everything the lexical
+// checks above cannot see, such as symbolic links pointing outside the location.
+int check_path_within_dir(const common::ObString &dir, const char *path)
+{
+  int ret = OB_SUCCESS;
+  char dir_buf[MAX_LOAD_FILE_PATH_LENGTH];
+  char resolved_dir[MAX_LOAD_FILE_PATH_LENGTH];
+  char resolved_path[MAX_LOAD_FILE_PATH_LENGTH];
+  if (OB_ISNULL(path) || OB_UNLIKELY(dir.length() <= 0 || dir.length() >= MAX_LOAD_FILE_PATH_LENGTH)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    MEMCPY(dir_buf, dir.ptr(), dir.length());
+    dir_buf[dir.length()] = '\0';
+    if (OB_ISNULL(SEEKDB_PATH_REALPATH(dir_buf, resolved_dir))
+        || OB_ISNULL(SEEKDB_PATH_REALPATH(path, resolved_path))) {
+      ret = OB_FILE_NOT_EXIST;
+    } else {
+      const int64_t dir_len = static_cast<int64_t>(strlen(resolved_dir));
+      const char dir_tail = (dir_len > 0) ? resolved_dir[dir_len - 1] : '\0';
+      const bool dir_has_sep = ('/' == dir_tail || '\\' == dir_tail);
+      const char path_tail = resolved_path[dir_len];
+      if (OB_UNLIKELY(0 != strncmp(resolved_path, resolved_dir, dir_len))
+          || OB_UNLIKELY(!dir_has_sep && '\0' != path_tail && '/' != path_tail && '\\' != path_tail)) {
+        ret = OB_INVALID_ARGUMENT;
+      }
+    }
+  }
+  return ret;
+}
+} // anonymous namespace
 
 ObExprLoadFile::ObExprLoadFile(common::ObIAllocator &alloc)
     : ObFuncExprOperator(alloc,
@@ -97,10 +188,16 @@ int ObExprLoadFile::eval_load_file(const ObExpr &expr,
         LOG_WARN("failed to set string result", K(ret), K(content.length()));
       }
     } else {
-      const int64_t sep_len = (dir.ptr()[dir.length() - 1] == '/' || dir.ptr()[dir.length() - 1] == '\\') ? 0 : 1;
-      const int64_t path_len = dir.length() + sep_len + file_datum->get_string().length();
+      const ObString file_name = file_datum->get_string();
+      const int64_t sep_len = (dir.length() > 0
+          && (dir.ptr()[dir.length() - 1] == '/' || dir.ptr()[dir.length() - 1] == '\\')) ? 0 : 1;
+      const int64_t path_len = dir.length() + sep_len + file_name.length();
       char *path_buf = NULL;
-      if (OB_UNLIKELY(path_len <= 0) || OB_ISNULL(path_buf = static_cast<char *>(tmp_alloc.alloc(path_len + 1)))) {
+      if (OB_FAIL(check_relative_file_name(file_name))) {
+        LOG_WARN("illegal file name for load_file", K(ret), K(file_name));
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "load_file, illegal file name");
+      } else if (OB_UNLIKELY(path_len <= 0 || path_len > MAX_LOAD_FILE_PATH_LENGTH)
+                 || OB_ISNULL(path_buf = static_cast<char *>(tmp_alloc.alloc(path_len + 1)))) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
         LOG_ERROR("alloc memory failed", K(ret), K(path_len));
       } else {
@@ -110,11 +207,14 @@ int ObExprLoadFile::eval_load_file(const ObExpr &expr,
         if (sep_len > 0) {
           path_buf[pos++] = '/';
         }
-        MEMCPY(path_buf + pos, file_datum->get_string().ptr(), file_datum->get_string().length());
-        pos += file_datum->get_string().length();
+        MEMCPY(path_buf + pos, file_name.ptr(), file_name.length());
+        pos += file_name.length();
         path_buf[pos] = '\0';
         full_path.assign_ptr(path_buf, static_cast<int32_t>(pos));
-        if (OB_FAIL(read_file_to_string(tmp_alloc, path_buf, content))) {
+        if (OB_FAIL(check_path_within_dir(dir, path_buf))) {
+          LOG_WARN("file is out of the location directory", K(ret), K(full_path));
+          LOG_USER_ERROR(OB_INVALID_ARGUMENT, "load_file, file is out of the location directory");
+        } else if (OB_FAIL(read_file_to_string(tmp_alloc, path_buf, content))) {
           LOG_WARN("failed to read file", K(ret), K(full_path));
           LOG_USER_ERROR(OB_FILE_NOT_EXIST, full_path.length(), full_path.ptr());
         } else if (OB_FAIL(ObAIFuncUtils::set_string_result(expr, ctx, expr_datum, content))) {
@@ -178,6 +278,9 @@ int ObExprLoadFile::read_file_to_string(common::ObIAllocator &allocator,
     } else if (OB_FAIL(fseek(fp, 0, SEEK_SET))) {
       ret = OB_IO_ERROR;
       LOG_WARN("fseek failed", K(ret), K(path));
+    } else if (OB_UNLIKELY(size > MAX_LOAD_FILE_SIZE)) {
+      ret = OB_SIZE_OVERFLOW;
+      LOG_WARN("file is too large to be loaded", K(ret), K(size), K(MAX_LOAD_FILE_SIZE), K(path));
     } else if (size > 0) {
       char *buf = static_cast<char *>(allocator.alloc(size + 1));
       if (OB_ISNULL(buf)) {

@@ -181,12 +181,15 @@ static int adjust_batch_size_for_text_topk(const ObLogPlan &log_plan, int64_t &b
       // emitted (id, score) pairs are corrupted as soon as the scan emits more
       // than one batch (e.g. `LIMIT 10 OFFSET 5` with a batch size of 16, or
       // `LIMIT 20` with a batch size of 16).
-      // The batch size is raised up to the fallback cap, so that all the rows
-      // needed by any LIMIT (and by the top-n sort of an OFFSET plan) are
-      // projected within a single batch.
-      int64_t expected = OB_MAX(max_topk, TEXT_TOPK_FALLBACK_BATCH_SIZE);
-      if (expected > TEXT_TOPK_FALLBACK_BATCH_SIZE) {
-        expected = TEXT_TOPK_FALLBACK_BATCH_SIZE;
+      // The batch size is raised to the fallback cap, but never above it: the
+      // datum arrays of the text retrieval iterator are allocated from the
+      // batch size, so a huge LIMIT must not become a huge per-batch
+      // allocation. A LIMIT beyond the cap is served by several batches, and
+      // those stay correct because every batch is consumed in slot order.
+      int64_t expected = TEXT_TOPK_FALLBACK_BATCH_SIZE;
+      if (max_topk > TEXT_TOPK_FALLBACK_BATCH_SIZE) {
+        LOG_TRACE("text retrieval limit is beyond the batch cap, multi batch scan",
+                  K(max_topk), K(expected));
       }
       if (expected > batch_size) {
         LOG_TRACE("enlarge batch size for text retrieval scan",

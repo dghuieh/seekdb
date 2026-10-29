@@ -762,6 +762,8 @@ int ObSRBMWIterImpl::project_rows_from_top_k_heap(const int64_t capacity, int64_
           {
             const ObObjType id_type = id_proj_expr->datum_meta_.type_;
             const ObDatum &src_id = id.get_datum();
+            const int64_t id_len = static_cast<int64_t>(sizeof(uint64_t) * 2);
+            char *id_dst = NULL;
             if (OB_ISNULL(src_id.ptr_)) {
               set_datum_func_(id_datums[out_idx], id);
             } else if (common::ObUInt64Type == id_type || common::ObIntType == id_type
@@ -779,12 +781,15 @@ int ObSRBMWIterImpl::project_rows_from_top_k_heap(const int64_t capacity, int64_
               // locate_datums_for_update(), which resets ptr_ back to the frame
               // result buffer; an aliased ptr_ silently loses the written doc id
               // and yields a stale value (observed id 1915 instead of 2939).
-              const char *id_dst = id_datums[out_idx].ptr_;
-              if (OB_ISNULL(id_dst)) {
-                id_datums[out_idx].set_string(common::ObString(static_cast<int32_t>(sizeof(uint64_t) * 2), src_id.ptr_));
+              // FIX(buf-overflow): the destination must come from the expression
+              // result buffer instead of reusing whatever ptr_ currently holds,
+              // otherwise a column with a shorter result buffer is overflowed.
+              if (OB_ISNULL(id_dst = id_proj_expr->get_str_res_mem(*eval_ctx, id_len, out_idx))) {
+                ret = OB_ALLOCATE_MEMORY_FAILED;
+                LOG_WARN("failed to get result memory for doc id", K(ret), K(id_len));
               } else {
-                MEMCPY(const_cast<char *>(id_dst), src_id.ptr_, sizeof(uint64_t) * 2);
-                id_datums[out_idx].set_string(common::ObString(static_cast<int32_t>(sizeof(uint64_t) * 2), id_dst));
+                MEMCPY(id_dst, src_id.ptr_, id_len);
+                id_datums[out_idx].set_string(common::ObString(static_cast<int32_t>(id_len), id_dst));
               }
             }
           }

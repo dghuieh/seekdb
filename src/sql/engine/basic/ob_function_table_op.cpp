@@ -224,7 +224,13 @@ int ObFunctionTableOp::inner_get_next_row_sys_func()
     } else {
       const int64_t col_cnt = MY_SPEC.column_exprs_.count();
       for (int64_t i = 0; OB_SUCC(ret) && i < col_cnt; ++i) {
-        ObDatum &datum = MY_SPEC.column_exprs_.at(i)->locate_datum_for_write(eval_ctx_);
+        ObExpr *col_expr = MY_SPEC.column_exprs_.at(i);
+        if (OB_ISNULL(col_expr)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("column expr of function table is null", K(ret), K(i), K(col_cnt));
+          break;
+        }
+        ObDatum &datum = col_expr->locate_datum_for_write(eval_ctx_);
         if (0 == i) {
           datum.set_int(split_ctx->cur_id_);
         } else if (1 == i) {
@@ -234,9 +240,13 @@ int ObFunctionTableOp::inner_get_next_row_sys_func()
         } else {
           datum.set_string(split_ctx->cur_text_);
         }
-        MY_SPEC.column_exprs_.at(i)->set_evaluated_projected(eval_ctx_);
+        col_expr->set_evaluated_projected(eval_ctx_);
       }
     }
+  } else if (OB_UNLIKELY(MY_SPEC.column_exprs_.empty() || OB_ISNULL(MY_SPEC.column_exprs_.at(0)))) {
+    // Defensive check: an empty column list would make at(0) below read out of bounds.
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("column exprs of function table is empty", K(ret), K(MY_SPEC.column_exprs_.count()));
   } else {
     MY_SPEC.column_exprs_.at(0)->locate_datum_for_write(eval_ctx_).set_datum(*value);
     MY_SPEC.column_exprs_.at(0)->set_evaluated_projected(eval_ctx_);

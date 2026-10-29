@@ -96,7 +96,8 @@ static int64_t json_get_int_field(const ObString &json, const char *key, int64_t
   const char *p = json.ptr();
   int64_t len = json.length();
   int64_t key_len = static_cast<int64_t>(strlen(key));
-  for (int64_t i = 0; i + key_len < len; ++i) {
+  // i + key_len + 1 < len: the closing quote of the key is read at i + key_len + 1
+  for (int64_t i = 0; i + key_len + 1 < len; ++i) {
     if (p[i] == '"' && 0 == strncmp(p + i + 1, key, key_len) && p[i + key_len + 1] == '"') {
       int64_t j = i + key_len + 1;
       if (j < len && p[j] == '"') { ++j; }
@@ -106,7 +107,11 @@ static int64_t json_get_int_field(const ObString &json, const char *key, int64_t
       bool started = false;
       if (j < len && p[j] == '-') { neg = true; ++j; }
       while (j < len && p[j] >= '0' && p[j] <= '9') {
-        val = val * 10 + (p[j] - '0');
+        // clamp instead of overflowing: max/overlap are user supplied and any
+        // value beyond this bound is meaningless for the split window
+        if (val <= 100000000LL) {
+          val = val * 10 + (p[j] - '0');
+        }
         ++j;
         started = true;
       }
@@ -124,7 +129,8 @@ static bool json_get_str_field(const ObString &json, const char *key, ObString &
   const char *p = json.ptr();
   int64_t len = json.length();
   int64_t key_len = static_cast<int64_t>(strlen(key));
-  for (int64_t i = 0; i + key_len < len; ++i) {
+  // i + key_len + 1 < len: the closing quote of the key is read at i + key_len + 1
+  for (int64_t i = 0; i + key_len + 1 < len; ++i) {
     if (p[i] == '"' && 0 == strncmp(p + i + 1, key, key_len) && p[i + key_len + 1] == '"') {
       int64_t j = i + key_len + 1;
       if (j < len && p[j] == '"') { ++j; }
@@ -360,7 +366,6 @@ int ObExprAISplitDocument::eval_split_document(const ObExpr &expr,
   ObExprAISplitDocumentCtx *split_ctx = NULL;
   uint64_t op_id = expr.expr_ctx_id_;
   ObExecContext &exec_ctx = ctx.exec_ctx_;
-  LOG_WARN("[AI_SPLIT_DBG] eval enter", K(op_id), K(expr.arg_cnt_));
   if (OB_ISNULL(split_ctx = static_cast<ObExprAISplitDocumentCtx *>(
               exec_ctx.get_expr_op_ctx(op_id)))) {
     if (OB_FAIL(exec_ctx.create_expr_op_ctx(op_id, split_ctx))) {
@@ -398,6 +403,7 @@ int ObExprAISplitDocument::eval_split_document(const ObExpr &expr,
           max_cnt = json_get_int_field(params_json, "max", 1);
           overlap = json_get_int_field(params_json, "overlap", 0);
           if (max_cnt < 1) { max_cnt = 1; }
+          if (max_cnt > 100000) { max_cnt = 100000; }
           if (overlap < 0) { overlap = 0; }
         }
       }
@@ -411,14 +417,12 @@ int ObExprAISplitDocument::eval_split_document(const ObExpr &expr,
             LOG_WARN("ai split document failed", K(ret));
           }
         }
-        LOG_WARN("[AI_SPLIT_DBG] init done", K(op_id), K(split_ctx->chunk_cnt_), K(is_markdown), K(is_word), K(max_cnt), K(overlap));
         split_ctx->inited_ = true;
       }
     }
   }
   if (OB_SUCC(ret)) {
     if (OB_UNLIKELY(split_ctx->row_idx_ >= split_ctx->chunk_cnt_)) {
-      LOG_WARN("[AI_SPLIT_DBG] iter end", K(op_id), K(split_ctx->row_idx_), K(split_ctx->chunk_cnt_), K(split_ctx->inited_));
       ret = OB_ITER_END;
     } else {
       int64_t idx = split_ctx->row_idx_;
@@ -426,7 +430,6 @@ int ObExprAISplitDocument::eval_split_document(const ObExpr &expr,
       split_ctx->cur_offset_ = split_ctx->chunk_offsets_[idx];
       split_ctx->cur_length_ = split_ctx->chunk_lengths_[idx];
       split_ctx->cur_text_ = split_ctx->chunk_texts_[idx];
-      LOG_WARN("[AI_SPLIT_DBG] row", K(op_id), K(idx), K(split_ctx->chunk_cnt_), K(split_ctx->inited_), K(split_ctx->cur_id_), K(split_ctx->cur_offset_), K(split_ctx->cur_length_), K(split_ctx->cur_text_));
       expr_datum.set_int(split_ctx->cur_id_);
       ++split_ctx->row_idx_;
     }
