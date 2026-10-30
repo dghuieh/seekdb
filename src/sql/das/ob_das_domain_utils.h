@@ -37,7 +37,7 @@ namespace sql
 // node freelist across docs; the row pool keeps initialized ObDatumRow buffers.
 struct ObFTWordRowsReuseCtx
 {
-  ObFTWordMap word_map;
+  storage::ObFTWordMap word_map;
   common::ObArenaAllocator row_alloc;
   blocksstable::ObDatumRow *row_pool;
   int64_t row_pool_cnt;

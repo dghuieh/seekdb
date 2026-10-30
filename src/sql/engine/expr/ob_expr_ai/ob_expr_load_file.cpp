@@ -18,8 +18,6 @@
 #include "ob_expr_load_file.h"
 #include "ob_ai_func_utils.h"
 #include "sql/engine/ob_exec_context.h"
-#include "share/schema/ob_schema_getter_guard.h"
-#include "share/schema/ob_location_schema_struct.h"
 #include "lib/oblog/ob_log_module.h"
 
 #include <stdio.h>
@@ -73,40 +71,33 @@ int ObExprLoadFile::eval_load_file(const ObExpr &expr,
   int ret = OB_SUCCESS;
   ObDatum *location_datum = NULL;
   ObDatum *file_datum = NULL;
-  ObSchemaGetterGuard schema_guard;
-  const ObLocationSchema *location_schema = NULL;
-  if (OB_ISNULL(GCTX.schema_service_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("get unexpected null", K(ret));
-  } else if (OB_FAIL(expr.eval_param_value(ctx, location_datum, file_datum))) {
+  if (OB_FAIL(expr.eval_param_value(ctx, location_datum, file_datum))) {
     LOG_WARN("evaluate parameters failed", K(ret));
   } else if (location_datum->is_null() || file_datum->is_null()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("load_file parameter is null", K(ret));
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "load_file, parameter is null");
     expr_datum.set_null();
-  } else if (OB_FAIL(GCTX.schema_service_->get_tenant_schema_guard(schema_guard))) {
-    LOG_WARN("failed to get tenant schema guard", K(ret));
-  } else if (OB_FAIL(schema_guard.get_location_schema_by_name(location_datum->get_string(),
-                                                              location_schema))) {
-    ret = OB_LOCATION_NOT_EXIST;
-    LOG_WARN("failed to get location schema", K(ret), K(location_datum->get_string()));
-    LOG_USER_ERROR(OB_LOCATION_NOT_EXIST, location_datum->get_string().length(),
-                   location_datum->get_string().ptr());
-  } else if (OB_ISNULL(location_schema)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("get null location schema", K(ret));
   } else {
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
     ObIAllocator &tmp_alloc = tmp_alloc_g.get_allocator();
     ObString dir;
     ObString full_path;
     ObString content;
-    if (OB_FAIL(get_location_dir(tmp_alloc, location_schema->get_location_url_str(), dir))) {
-      LOG_WARN("failed to parse location url", K(ret), K(location_schema->get_location_url_str()));
+    // the first argument is the base directory (a plain path or a file:// url);
+    // an empty string means the second argument is already a full path.
+    if (OB_FAIL(get_location_dir(tmp_alloc, location_datum->get_string(), dir))) {
+      LOG_WARN("failed to parse base dir", K(ret), K(location_datum->get_string()));
+    } else if (dir.empty()) {
+      full_path = file_datum->get_string();
+      if (OB_FAIL(read_file_to_string(tmp_alloc, full_path.ptr(), content))) {
+        LOG_WARN("failed to read file", K(ret), K(full_path));
+        LOG_USER_ERROR(OB_FILE_NOT_EXIST, full_path.length(), full_path.ptr());
+      } else if (OB_FAIL(ObAIFuncUtils::set_string_result(expr, ctx, expr_datum, content))) {
+        LOG_WARN("failed to set string result", K(ret), K(content.length()));
+      }
     } else {
-      const int64_t sep_len = (dir.length() > 0
-          && (dir.ptr()[dir.length() - 1] == '/' || dir.ptr()[dir.length() - 1] == '\\')) ? 0 : 1;
+      const int64_t sep_len = (dir.ptr()[dir.length() - 1] == '/' || dir.ptr()[dir.length() - 1] == '\\') ? 0 : 1;
       const int64_t path_len = dir.length() + sep_len + file_datum->get_string().length();
       char *path_buf = NULL;
       if (OB_UNLIKELY(path_len <= 0) || OB_ISNULL(path_buf = static_cast<char *>(tmp_alloc.alloc(path_len + 1)))) {
@@ -149,8 +140,7 @@ int ObExprLoadFile::get_location_dir(common::ObIAllocator &allocator,
     len -= prefix_len;
   }
   if (len <= 0) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid location url", K(ret), K(url));
+    dir.reset();
   } else {
     char *buf = static_cast<char *>(allocator.alloc(len + 1));
     if (OB_ISNULL(buf)) {
