@@ -279,20 +279,28 @@ int ObDASDomainUtils::build_ft_doc_word_infos(
 
 namespace
 {
-int ensure_ft_word_map_ready(ObFTWordMap &word_map, const int64_t bkt_cnt)
+// Fixed bucket count for the reused per-build word map. The map is created once
+// per index build and then only cleared (reuse()) for every document. The bucket
+// count used to follow the document length, so nearly every document destroyed
+// and re-created the hash table (bucket array + node free list), which dominated
+// the tokenization path. 997 is the same prime the old code capped at, so the
+// worst case bucket count (and memory footprint per build) stays unchanged.
+static constexpr int64_t FT_WORD_MAP_FIXED_BUCKET_CNT = 997;
+
+int ensure_ft_word_map_ready(ObFTWordMap &word_map,
+                             const int64_t bkt_cnt,
+                             const bool reusable)
 {
   int ret = OB_SUCCESS;
-  const int64_t need_bucket_cnt = common::hash::cal_next_prime(bkt_cnt);
+  const int64_t create_bkt_cnt = reusable ? FT_WORD_MAP_FIXED_BUCKET_CNT : bkt_cnt;
   if (!word_map.created()) {
-    ret = word_map.create(bkt_cnt, common::ObMemAttr("FTWordMap"));
-  } else if (word_map.bucket_count() != need_bucket_cnt) {
-    // keep bucket count identical with the per-doc create path so that the hash
-    // iteration order (and thus the emitted word row order) stays identical
-    if (OB_FAIL(word_map.destroy())) {
-      LOG_WARN("fail to destroy reused ft word map", K(ret));
-    } else if (OB_FAIL(word_map.create(bkt_cnt, common::ObMemAttr("FTWordMap")))) {
-      LOG_WARN("fail to recreate ft word map", K(ret), K(bkt_cnt));
+    if (OB_FAIL(word_map.create(create_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
+      LOG_WARN("fail to create ft word map", K(ret), K(create_bkt_cnt));
     }
+  } else if (OB_FAIL(word_map.reuse())) {
+    // Keep the allocated bucket array and node free list, only drop the entries
+    // of the previous document.
+    LOG_WARN("fail to reuse ft word map", K(ret), K(word_map.bucket_count()));
   }
   return ret;
 }
@@ -344,7 +352,7 @@ int ensure_ft_word_row_pool(ObFTWordRowsReuseCtx &ctx, const int64_t need_rows, 
     ret = OB_INVALID_ARGUMENT;
   } else if (0 == fulltext.length()) {
     ret = OB_ITER_END;
-  } else if (OB_FAIL(ensure_ft_word_map_ready(ft_word_map, ft_word_bkt_cnt))) {
+  } else if (OB_FAIL(ensure_ft_word_map_ready(ft_word_map, ft_word_bkt_cnt, nullptr != reuse_ctx))) {
     LOG_WARN("fail to prepare ft word map", K(ret), K(ft_word_bkt_cnt), KP(reuse_ctx));
   } else if (OB_FAIL(segment_and_calc_word_count(allocator,
                                                  helper,
