@@ -354,15 +354,19 @@ int ensure_ft_word_row_pool(ObFTWordRowsReuseCtx &ctx, const int64_t need_rows, 
   static constexpr int64_t FT_MAX_WORD_BUCKET = 997;
   const int64_t ft_word_bkt_cnt = MIN(MAX(fulltext.length() / 10, 2), FT_MAX_WORD_BUCKET);
   int64_t doc_length = 0;
+  // Keep the per-document word map: sharing one map across documents makes every
+  // later document insert into the widest bucket array seen so far (the map is
+  // never shrunk), which measured slower than the per-document create path on the
+  // beng/en build. Only the datum row pool below is reused across documents.
   ObFTWordMap local_ft_word_map;
-  ObFTWordMap &ft_word_map = (nullptr != reuse_ctx) ? reuse_ctx->word_map : local_ft_word_map;
+  ObFTWordMap &ft_word_map = local_ft_word_map;
   void *rows_buf = nullptr;
   blocksstable::ObDatumRow *rows = nullptr;
   if (OB_ISNULL(helper) || OB_UNLIKELY(!ft_obj_meta.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
   } else if (0 == fulltext.length()) {
     ret = OB_ITER_END;
-  } else if (OB_FAIL(ensure_ft_word_map_ready(ft_word_map, ft_word_bkt_cnt, nullptr != reuse_ctx))) {
+  } else if (OB_FAIL(ensure_ft_word_map_ready(ft_word_map, ft_word_bkt_cnt, false))) {
     LOG_WARN("fail to prepare ft word map", K(ret), K(ft_word_bkt_cnt), KP(reuse_ctx));
   } else if (OB_FAIL(segment_and_calc_word_count(allocator,
                                                  helper,
