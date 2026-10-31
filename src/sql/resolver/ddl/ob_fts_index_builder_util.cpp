@@ -25,7 +25,6 @@
 #include "data_plane/fts/ob_fts_parser_helper.h"
 #include "share/schema/ob_multi_version_schema_service.h"
 #include "share/schema/ob_schema_utils.h"
-#include "lib/cpu/ob_cpu_topology.h"
 
 namespace oceanbase
 {
@@ -1032,40 +1031,9 @@ int ObFtsIndexBuilderUtil::generate_doc_id_column(
   return ret;
 }
 
-namespace
-{
-// Cap for the parallelism of an index build task.
-//
-// decided_parallelism bounds how many workers of a build task run concurrently.
-// Pushing it above the number of usable physical cores only adds contention:
-// every worker keeps its own row buffers and arena while competing for the same
-// cores, which was measured as a net slowdown (negative improvement) when
-// several builds share one machine. The data volume cap keeps small builds from
-// paying thread startup / synchronization cost for a handful of rows.
-static constexpr int64_t FTS_BYTES_PER_WORKER = 1024LL * 1024LL;
-
-int64_t calc_adaptive_parallelism(const int64_t original_parallelism,
-                                  const int64_t data_size,
-                                  const int64_t concurrency_divisor)
-{
-  int64_t cpu_cnt = common::get_cpu_count();
-  if (cpu_cnt <= 0) {
-    cpu_cnt = 1;
-  }
-  int64_t limit = MAX(cpu_cnt / MAX(concurrency_divisor, 1L), 1L);
-  if (data_size > 0) {
-    const int64_t volume_limit =
-        MAX((data_size + FTS_BYTES_PER_WORKER - 1) / FTS_BYTES_PER_WORKER, 1L);
-    limit = MIN(limit, volume_limit);
-  }
-  return MAX(MIN(original_parallelism, limit), 1L);
-}
-} // unnamed namespace
-
 int ObFtsIndexBuilderUtil::decide_parallelism(
     const share::schema::ObIndexType index_type,
     const int64_t original_parallelism,
-    const int64_t data_size,
     int64_t &decided_parallelism)
 {
   int ret = OB_SUCCESS;
@@ -1079,14 +1047,14 @@ int ObFtsIndexBuilderUtil::decide_parallelism(
       case share::schema::ObIndexType::INDEX_TYPE_DOC_ID_ROWKEY_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_FTS_INDEX_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_FTS_DOC_WORD_LOCAL:
-        decided_parallelism = calc_adaptive_parallelism(original_parallelism, data_size, 1);
+        decided_parallelism = MAX(original_parallelism, 1L);
         break;
       case share::schema::ObIndexType::INDEX_TYPE_NORMAL_MULTIVALUE_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_UNIQUE_MULTIVALUE_LOCAL:
-        decided_parallelism = calc_adaptive_parallelism(original_parallelism, data_size, 2);
+        decided_parallelism = MAX(original_parallelism / 2, 1L);
         break;
       case share::schema::ObIndexType::INDEX_TYPE_VEC_SPIV_DIM_DOCID_VALUE_LOCAL:
-        decided_parallelism = calc_adaptive_parallelism(original_parallelism, data_size, 2);
+        decided_parallelism = MAX(original_parallelism / 2, 1L);
         break;
       default:
         decided_parallelism = 1;

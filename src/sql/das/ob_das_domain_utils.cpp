@@ -279,28 +279,38 @@ int ObDASDomainUtils::build_ft_doc_word_infos(
 
 namespace
 {
-// Fixed bucket count for the reused per-build word map. The map is created once
-// per index build and then only cleared (reuse()) for every document. The bucket
-// count used to follow the document length, so nearly every document destroyed
-// and re-created the hash table (bucket array + node free list), which dominated
-// the tokenization path. 997 is the same prime the old code capped at, so the
-// worst case bucket count (and memory footprint per build) stays unchanged.
-static constexpr int64_t FT_WORD_MAP_FIXED_BUCKET_CNT = 997;
-
+// The reused per-build word map is created once and afterwards only cleared
+// (reuse()) per document, so the bucket array and node free list are kept across
+// documents. The bucket count used to follow the length of each document, which
+// made nearly every document destroy and re-create the hash table (bucket array
+// plus node free list) and dominated the tokenization path. The map is now grown
+// only when a document needs more buckets than the current array provides; it is
+// never shrunk, so long documents keep the wide array for later documents.
 int ensure_ft_word_map_ready(ObFTWordMap &word_map,
                              const int64_t bkt_cnt,
                              const bool reusable)
 {
   int ret = OB_SUCCESS;
-  const int64_t create_bkt_cnt = reusable ? FT_WORD_MAP_FIXED_BUCKET_CNT : bkt_cnt;
+  const int64_t need_bucket_cnt = common::hash::cal_next_prime(bkt_cnt);
+  const bool bucket_enough = word_map.created() && word_map.bucket_count() >= need_bucket_cnt;
   if (!word_map.created()) {
-    if (OB_FAIL(word_map.create(create_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
-      LOG_WARN("fail to create ft word map", K(ret), K(create_bkt_cnt));
+    if (OB_FAIL(word_map.create(bkt_cnt, common::ObMemAttr("FTWordMap")))) {
+      LOG_WARN("fail to create ft word map", K(ret), K(bkt_cnt));
     }
-  } else if (OB_FAIL(word_map.reuse())) {
+  } else if (reusable && bucket_enough) {
     // Keep the allocated bucket array and node free list, only drop the entries
     // of the previous document.
-    LOG_WARN("fail to reuse ft word map", K(ret), K(word_map.bucket_count()));
+    if (OB_FAIL(word_map.reuse())) {
+      LOG_WARN("fail to reuse ft word map", K(ret), K(word_map.bucket_count()));
+    }
+  } else {
+    // The map must be rebuilt: either the caller keeps a per-document map (no
+    // reuse context) or this document needs more buckets than the current array.
+    if (OB_FAIL(word_map.destroy())) {
+      LOG_WARN("fail to destroy ft word map", K(ret));
+    } else if (OB_FAIL(word_map.create(bkt_cnt, common::ObMemAttr("FTWordMap")))) {
+      LOG_WARN("fail to recreate ft word map", K(ret), K(bkt_cnt));
+    }
   }
   return ret;
 }
